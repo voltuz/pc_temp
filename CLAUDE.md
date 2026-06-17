@@ -27,12 +27,13 @@ LibreHardwareMonitor — even the latest pre-release — **cannot read this mach
 
 1. `app.py:main()` self-elevates: `_relaunch_as_admin()` re-launches via `_pythonw()` + `ShellExecuteW("runas", ...)` so the elevated instance has no console; `_hide_console()` is a fallback if started under `python.exe`.
 2. `App` (in `app.py`) starts a `Poller` thread and drives the Tk UI:
-   - `Poller.run()` calls `sensors.HWiNFOProcess.start()` to launch `tools\hwinfo\HWiNFO64.exe` **hidden + elevated** (via `ShellExecuteEx` — `subprocess`/`CreateProcess` fails with error 740 on the requireAdministrator manifest). It then reads `sensors.SharedMemoryReader.read()` once per `POLL_INTERVAL` and pushes `("data", cpu, gpu)` onto a `queue.Queue`.
+   - `Poller.run()` calls `sensors.HWiNFOProcess.start()` to launch `tools\hwinfo\HWiNFO64.exe` **hidden + elevated**, then reads `sensors.SharedMemoryReader.read()` once per `POLL_INTERVAL` and pushes `("data", cpu, gpu)` onto a `queue.Queue`.
    - `App._tick()` (scheduled with `root.after`) drains the queue, appends to `cpu_hist` / `gpu_hist` deques, updates the two numeric readouts, and redraws the two graphs.
 3. On window close, `App.on_close()` stops the poller, whose `_cleanup()` terminates HWiNFO — **only if the app started it** (`_we_started`); a pre-existing user HWiNFO instance is reused and left alone.
 
 ### HWiNFO lifecycle quirks (in `sensors.py:HWiNFOProcess` + `app.py:Poller`)
-- **Window hiding:** HWiNFO ignores the `SW_HIDE` launch hint, so `hide_windows()` force-hides its top-level windows by PID via `ShowWindow(SW_HIDE)`, called repeatedly during startup (`_wait_for_sm`) and once per poll.
+- **Launch (no visible window at all):** `start()` first tries `_start_hidden_desktop()` — `CreateProcessW` onto a never-displayed desktop (`CreateDesktopW`) with `__COMPAT_LAYER=RunAsInvoker` set, so the `requireAdministrator` exe launches without the 740 error and (because we're already elevated) inherits our admin token. Its window renders on the hidden desktop, so it never appears. If that fails, `start()` falls back to `ShellExecuteEx` + `SW_HIDE`.
+- **`hide_windows()`** (force-hide by PID via `ShowWindow(SW_HIDE)`, called from `_wait_for_sm` and each poll) is now only the safety net for the `ShellExecuteEx` fallback; it no-ops when the hidden-desktop launch succeeds, since `EnumWindows` only sees the visible desktop.
 - **Watchdog:** if shared memory yields no readings for `STALE_LIMIT` polls (e.g. HWiNFO Free disables shared memory after ~12 h), the poller restarts HWiNFO.
 - HWiNFO's tray icon cannot be suppressed programmatically — it's hidden via a one-time Windows Taskbar setting (documented in README).
 

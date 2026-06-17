@@ -45,6 +45,10 @@ _FILE_MAP_READ = 0x0004
 _SEE_MASK_NOCLOSEPROCESS = 0x00000040
 _SW_HIDE = 0
 _WAIT_TIMEOUT = 0x00000102
+_GENERIC_ALL = 0x10000000
+_CREATE_NO_WINDOW = 0x08000000
+_STARTF_USESHOWWINDOW = 0x00000001
+_HIDDEN_DESKTOP_NAME = "pctemp_monitor"
 
 _k = ctypes.WinDLL("kernel32", use_last_error=True)
 _k.OpenFileMappingW.restype = wintypes.HANDLE
@@ -74,6 +78,56 @@ _user32.IsWindowVisible.restype = wintypes.BOOL
 _user32.IsWindowVisible.argtypes = [wintypes.HWND]
 _user32.ShowWindow.restype = wintypes.BOOL
 _user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+
+# Hidden-desktop launch: run HWiNFO on a desktop that is never displayed, so its
+# window never flashes on the user's desktop.
+_user32.CreateDesktopW.restype = wintypes.HANDLE
+_user32.CreateDesktopW.argtypes = [
+    wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p,
+    wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+]
+_user32.CloseDesktop.restype = wintypes.BOOL
+_user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+
+
+class _STARTUPINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("lpReserved", wintypes.LPWSTR),
+        ("lpDesktop", wintypes.LPWSTR),
+        ("lpTitle", wintypes.LPWSTR),
+        ("dwX", wintypes.DWORD),
+        ("dwY", wintypes.DWORD),
+        ("dwXSize", wintypes.DWORD),
+        ("dwYSize", wintypes.DWORD),
+        ("dwXCountChars", wintypes.DWORD),
+        ("dwYCountChars", wintypes.DWORD),
+        ("dwFillAttribute", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("wShowWindow", wintypes.WORD),
+        ("cbReserved2", wintypes.WORD),
+        ("lpReserved2", ctypes.c_void_p),
+        ("hStdInput", wintypes.HANDLE),
+        ("hStdOutput", wintypes.HANDLE),
+        ("hStdError", wintypes.HANDLE),
+    ]
+
+
+class _PROCESS_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("hProcess", wintypes.HANDLE),
+        ("hThread", wintypes.HANDLE),
+        ("dwProcessId", wintypes.DWORD),
+        ("dwThreadId", wintypes.DWORD),
+    ]
+
+
+_k.CreateProcessW.restype = wintypes.BOOL
+_k.CreateProcessW.argtypes = [
+    wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p,
+    wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR,
+    ctypes.POINTER(_STARTUPINFOW), ctypes.POINTER(_PROCESS_INFORMATION),
+]
 
 
 def _cstr(data: bytes, off: int, maxlen: int = 128) -> str:
@@ -226,6 +280,7 @@ class HWiNFOProcess:
         self.exe = exe
         self._hprocess = None
         self._pid = 0
+        self._hdesk = None
 
     @property
     def exe_exists(self) -> bool:
@@ -234,6 +289,10 @@ class HWiNFOProcess:
     def start(self) -> bool:
         if not self.exe_exists:
             return False
+        # Preferred: launch on a hidden desktop so the window never appears at all.
+        if self._start_hidden_desktop():
+            return True
+        # Fallback: visible-desktop launch (brief flash, hidden by hide_windows()).
         sei = _SHELLEXECUTEINFOW()
         sei.cbSize = ctypes.sizeof(sei)
         sei.fMask = _SEE_MASK_NOCLOSEPROCESS
@@ -246,6 +305,52 @@ class HWiNFOProcess:
             self._pid = _k.GetProcessId(sei.hProcess)
             return True
         return False
+
+    def _start_hidden_desktop(self) -> bool:
+        """Launch HWiNFO on a non-visible desktop via CreateProcess.
+
+        HWiNFO is requireAdministrator, so CreateProcess would normally fail with
+        ERROR_ELEVATION_REQUIRED; setting __COMPAT_LAYER=RunAsInvoker lets it
+        succeed, and because this process is already elevated, HWiNFO inherits
+        the elevated token. Its window renders on the hidden desktop, never on
+        the user's. Returns False on any failure so start() can fall back.
+        """
+        try:
+            hdesk = _user32.CreateDesktopW(
+                _HIDDEN_DESKTOP_NAME, None, None, 0, _GENERIC_ALL, None
+            )
+            if not hdesk:
+                return False
+            prev = os.environ.get("__COMPAT_LAYER")
+            os.environ["__COMPAT_LAYER"] = "RunAsInvoker"
+            try:
+                si = _STARTUPINFOW()
+                si.cb = ctypes.sizeof(si)
+                si.lpDesktop = _HIDDEN_DESKTOP_NAME
+                si.dwFlags = _STARTF_USESHOWWINDOW
+                si.wShowWindow = _SW_HIDE
+                pi = _PROCESS_INFORMATION()
+                ok = _k.CreateProcessW(
+                    self.exe, None, None, None, False, _CREATE_NO_WINDOW,
+                    None, os.path.dirname(self.exe),
+                    ctypes.byref(si), ctypes.byref(pi),
+                )
+            finally:
+                if prev is None:
+                    os.environ.pop("__COMPAT_LAYER", None)
+                else:
+                    os.environ["__COMPAT_LAYER"] = prev
+            if not ok:
+                _user32.CloseDesktop(hdesk)
+                return False
+            if pi.hThread:
+                _k.CloseHandle(pi.hThread)
+            self._hprocess = pi.hProcess
+            self._pid = pi.dwProcessId
+            self._hdesk = hdesk
+            return True
+        except Exception:
+            return False
 
     def hide_windows(self) -> int:
         """Force-hide any visible top-level windows owned by HWiNFO.
@@ -285,6 +390,9 @@ class HWiNFOProcess:
                 _k.CloseHandle(self._hprocess)
                 self._hprocess = None
                 self._pid = 0
+        if self._hdesk:
+            _user32.CloseDesktop(self._hdesk)
+            self._hdesk = None
 
 
 if __name__ == "__main__":
