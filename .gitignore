@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Claude Code local settings
+.claude/
+
+# HWiNFO portable binary — third-party, re-downloaded by setup.ps1 (not redistributed)
+tools/hwinfo/*.exe
+
+# OS / editor cruft
+Thumbs.db
+desktop.ini
